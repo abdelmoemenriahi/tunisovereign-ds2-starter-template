@@ -1,86 +1,128 @@
-from django.db import models
-from django.contrib.auth.models import AbstractUser
 import uuid
+
+from django.contrib.auth.models import AbstractUser
+from django.db import models
 
 
 class StakeholderUser(AbstractUser):
     class Role(models.TextChoices):
-        COOP_MEMBER = "COOP_MEMBER", "Farmer / Citizen / Field Operator"
-        REGIONAL_AUDITOR = "REGIONAL_AUDITOR", "Regional GDA / PCT / Municipal Auditor"
-        NATIONAL_ADMIN = "NATIONAL_ADMIN", "Governorate / National Ministry Admin"
+        STUDENT = "STUDENT", "Student submitting a project"
+        MENTOR_AUDITOR = "MENTOR_AUDITOR", "Teacher / Industry Mentor Auditor"
+        NATIONAL_ADMIN = "NATIONAL_ADMIN", "University / Ministry Admin"
         AGENT_SERVICE = "AGENT_SERVICE", "Autonomous AI Agent & MCP Service Account"
 
-    role = models.CharField(max_length=24, choices=Role.choices, default=Role.COOP_MEMBER)
-    governorate = models.CharField(max_length=64, db_index=True, default="Kasserine")
+    role = models.CharField(max_length=24, choices=Role.choices, default=Role.STUDENT)
+    institution = models.CharField(max_length=120, db_index=True, default="ISG Tunis")
+    governorate = models.CharField(max_length=64, db_index=True, default="Tunis")
     wallet_address = models.CharField(max_length=42, blank=True, null=True)
     preferred_dialect = models.CharField(max_length=16, default="ar-TN")
 
 
-class CooperativeUnit(models.Model):
+class Cohort(models.Model):
+    """Promotion / department that groups student submissions."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=120)
+    institution = models.CharField(max_length=120, db_index=True)
     governorate = models.CharField(max_length=64, db_index=True)
-    track_domain = models.CharField(max_length=64, default="Track_01_Water_Agri")
-    daily_quota_limit = models.FloatField(help_text="Max daily resource/water/medicine quota")
+    track_domain = models.CharField(max_length=64, default="Track_06_Skills_DID")
+    min_test_pass_pct = models.FloatField(default=85.0, help_text="Minimum test pass rate (%)")
+    max_high_severity_findings = models.PositiveIntegerField(default=0)
     contract_address = models.CharField(max_length=42, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-
-class ResourceNodePlot(models.Model):
-    coop = models.ForeignKey(CooperativeUnit, on_delete=models.CASCADE, related_name="nodes")
-    owner = models.ForeignKey(StakeholderUser, on_delete=models.CASCADE, related_name="owned_nodes")
-    node_code = models.CharField(max_length=32, unique=True)
-    crop_or_sector_type = models.CharField(max_length=64)
-    allocated_share_pct = models.FloatField(default=10.0)
-    is_valve_or_dispatch_active = models.BooleanField(default=False)
+    def __str__(self):
+        return self.name
 
 
-class TelemetryReading(models.Model):
+class ProjectSubmission(models.Model):
+    class Status(models.TextChoices):
+        SUBMITTED = "SUBMITTED", "Submitted"
+        ANALYZING = "ANALYZING", "Under analysis"
+        AUDITED = "AUDITED", "Audited"
+        DEFENSE_PENDING = "DEFENSE_PENDING", "Oral defense pending"
+        CREDENTIAL_ISSUED = "CREDENTIAL_ISSUED", "Credential issued"
+        REJECTED = "REJECTED", "Rejected"
+
+    cohort = models.ForeignKey(Cohort, on_delete=models.CASCADE, related_name="submissions")
+    student = models.ForeignKey(StakeholderUser, on_delete=models.CASCADE, related_name="submissions")
+    project_code = models.CharField(max_length=32, unique=True)
+    title = models.CharField(max_length=160)
+    repo_url = models.URLField()
+    primary_language = models.CharField(max_length=32, default="Python")
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.SUBMITTED)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["cohort", "status"])]
+
+    def __str__(self):
+        return self.project_code
+
+
+class AnalysisMetric(models.Model):
     class MetricType(models.TextChoices):
-        SOIL_MOISTURE = "MOISTURE", "Soil Moisture (%)"
-        AQUIFER_FLOW = "FLOW", "Flow / Dispensation Rate (L/min or Units/h)"
-        TEMPERATURE = "TEMP", "Ambient / Cold-Chain Temperature (C)"
-        PRESSURE_OR_STOCK = "STOCK", "Piezo Pressure / Inventory Level"
+        CYCLOMATIC = "CYCLO", "Cyclomatic Complexity"
+        TEST_PASS = "TESTPASS", "Test Pass Rate (%)"
+        SECURITY_SCORE = "SECURITY", "Bandit / Semgrep Security Score"
+        AST_SIMILARITY = "ASTSIM", "AST Similarity Score (%)"
 
-    node = models.ForeignKey(ResourceNodePlot, on_delete=models.CASCADE, related_name="readings")
+    submission = models.ForeignKey(ProjectSubmission, on_delete=models.CASCADE, related_name="metrics")
     timestamp = models.DateTimeField(db_index=True)
     metric_type = models.CharField(max_length=16, choices=MetricType.choices)
     value = models.FloatField()
-    ingestion_protocol = models.CharField(max_length=16, default="gRPC")
+    ingestion_protocol = models.CharField(max_length=16, default="gRPC")  # REST, gRPC, GraphQL
 
     class Meta:
-        indexes = [models.Index(fields=["node", "metric_type", "-timestamp"])]
+        indexes = [models.Index(fields=["submission", "metric_type", "-timestamp"])]
 
 
-class AnomalyAndForecastEvent(models.Model):
+class AuditFinding(models.Model):
     class Severity(models.TextChoices):
         LOW = "LOW", "Low"
         MEDIUM = "MEDIUM", "Medium"
-        CRITICAL = "CRITICAL", "Critical Breach / Leak / Diversion"
+        CRITICAL = "CRITICAL", "Critical (plagiarism / vulnerability / secret)"
 
-    node = models.ForeignKey(ResourceNodePlot, on_delete=models.CASCADE, related_name="anomalies")
+    class FindingType(models.TextChoices):
+        AST_PLAGIARISM = "AST_PLAGIARISM", "Plagiarized AST signature"
+        SQL_INJECTION = "SQL_INJECTION", "Vulnerable SQL pattern"
+        SECRET_EXPOSED = "SECRET_EXPOSED", "Hard-coded secret"
+        LOW_TEST_COVERAGE = "LOW_TESTS", "Test pass rate below threshold"
+        OTHER = "OTHER", "Other"
+
+    submission = models.ForeignKey(ProjectSubmission, on_delete=models.CASCADE, related_name="findings")
     detected_at = models.DateTimeField(auto_now_add=True)
-    anomaly_type = models.CharField(max_length=64)
+    finding_type = models.CharField(max_length=24, choices=FindingType.choices)
     severity = models.CharField(max_length=16, choices=Severity.choices)
-    isolation_forest_score = models.FloatField()
-    forecasted_deficit_24h = models.FloatField(default=0.0)
+    description = models.TextField(blank=True)
+    isolation_forest_score = models.FloatField(default=0.0)
+    forecasted_skill_gap_pct = models.FloatField(default=0.0)
+
+    class Meta:
+        indexes = [models.Index(fields=["submission", "-detected_at"])]
 
 
 class AgentLoopExecution(models.Model):
     thread_id = models.CharField(max_length=64, db_index=True)
-    trigger_source = models.CharField(max_length=64)
-    darja_transcript = models.TextField(blank=True)
+    submission = models.ForeignKey(
+        ProjectSubmission, null=True, blank=True, on_delete=models.SET_NULL, related_name="agent_runs"
+    )
+    trigger_source = models.CharField(max_length=64)  # Submission, gRPC_Anomaly, Scheduled_Audit
+    input_transcript = models.TextField(blank=True)
     parsed_intent_json = models.JSONField(default=dict)
     mcp_tools_invoked = models.JSONField(default=list)
     skills_executed = models.JSONField(default=list)
+    oral_defense_questions = models.JSONField(default=list)
     final_recommendation = models.TextField()
     confidence_score = models.FloatField()
     created_at = models.DateTimeField(auto_now_add=True)
 
 
-class OnChainZKReceipt(models.Model):
-    agent_execution = models.OneToOneField(AgentLoopExecution, on_delete=models.CASCADE, related_name="zk_receipt")
-    zk_commitment_hash = models.CharField(max_length=66, unique=True)
+class VerifiableCredentialReceipt(models.Model):
+    agent_execution = models.OneToOneField(
+        AgentLoopExecution, on_delete=models.CASCADE, related_name="vc_receipt"
+    )
+    student_did = models.CharField(max_length=128)
+    vc_commitment_hash = models.CharField(max_length=66, unique=True)
     public_inputs_json = models.JSONField(default=dict)
     tx_hash = models.CharField(max_length=66, unique=True)
     block_number = models.PositiveIntegerField()
