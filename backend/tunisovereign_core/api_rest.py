@@ -1,165 +1,134 @@
-"""
-Django 6 REST API Layer (Django REST Framework + SimpleJWT)
-Exposes:
-- POST /api/auth/register/ and POST /api/auth/login/ (Custom JWT claims: role, governorate, wallet_address)
-- GET/POST /api/v1/cooperatives/, /api/v1/telemetry/, /api/v1/anomalies/, /api/v1/zk-receipts/
-- POST /api/v1/darja-intent/ (Ingests Tunisian Darja voice transcript or text and triggers LangGraph loop)
-"""
-from rest_framework import serializers, viewsets, permissions, status
-from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.response import Response
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from rest_framework_simplejwt.views import TokenObtainPairView
+"""REST API (Django REST Framework) for Track 6 - TuniSkill-DID.
 
+Endpoints (all under /api/v1/, JWT Bearer token required):
+    cohorts/        CRUD (read: any user, write: NATIONAL_ADMIN)
+    submissions/    students create + see their own; staff see all and manage status
+    metrics/        code-analysis metrics (read: scoped, write: mentor/admin/agent)
+    findings/       audit findings    (read: scoped, write: mentor/admin/agent)
+    executions/     AI agent runs     (read-only, scoped)
+    credentials/    verifiable credential receipts (read-only, scoped)
+"""
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, mixins, viewsets
+from rest_framework.permissions import IsAuthenticated
+
+from .filters import AnalysisMetricFilter, AuditFindingFilter, ProjectSubmissionFilter
 from .models import (
-    StakeholderUser,
-    CooperativeUnit,
-    ResourceNodePlot,
-    TelemetryReading,
-    AnomalyAndForecastEvent,
     AgentLoopExecution,
-    OnChainZKReceipt,
+    AnalysisMetric,
+    AuditFinding,
+    Cohort,
+    ProjectSubmission,
+    VerifiableCredentialReceipt,
 )
-from agent.langgraph_agent import run_sovereign_agent_loop
+from .permissions import (
+    IsMentorAuditor,
+    IsStaffRole,
+    IsStudent,
+    ReadOnlyOrNationalAdmin,
+    is_staff_role,
+    submissions_for,
+)
+from .serializers import (
+    AgentLoopExecutionSerializer,
+    AnalysisMetricSerializer,
+    AuditFindingSerializer,
+    CohortSerializer,
+    ProjectSubmissionSerializer,
+    VerifiableCredentialReceiptSerializer,
+)
+
+FILTERS = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
 
 
-# ============================================================================
-# 1. Custom SimpleJWT Claims Serializer (Role, Governorate & Wallet Address)
-# ============================================================================
-class SovereignTokenObtainPairSerializer(TokenObtainPairSerializer):
-    @classmethod
-    def get_token(cls, user: StakeholderUser):
-        token = super().get_token(user)
-        token["role"] = user.role
-        token["governorate"] = user.governorate
-        token["wallet_address"] = user.wallet_address or ""
-        token["preferred_dialect"] = user.preferred_dialect
-        return token
+class StudentScopedMixin:
+    """Row-level security: students only see rows linked to their own submissions."""
+
+    student_lookup = "submission__student"
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if is_staff_role(user):
+            return qs
+        if user.is_authenticated:
+            return qs.filter(**{self.student_lookup: user})
+        return qs.none()
 
 
-class SovereignTokenObtainPairView(TokenObtainPairView):
-    serializer_class = SovereignTokenObtainPairSerializer
+class CohortViewSet(viewsets.ModelViewSet):
+    queryset = Cohort.objects.all().order_by("-created_at")
+    serializer_class = CohortSerializer
+    permission_classes = [ReadOnlyOrNationalAdmin]
+    filter_backends = FILTERS
+    filterset_fields = ["institution", "governorate", "track_domain"]
+    search_fields = ["name", "institution"]
+    ordering_fields = ["name", "created_at"]
 
 
-# ============================================================================
-# 2. Role-Based Permission Classes
-# ============================================================================
-class IsCoopMember(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(request.user and request.user.is_authenticated)
+class ProjectSubmissionViewSet(viewsets.ModelViewSet):
+    queryset = ProjectSubmission.objects.select_related("cohort", "student").order_by("-submitted_at")
+    serializer_class = ProjectSubmissionSerializer
+    filter_backends = FILTERS
+    filterset_class = ProjectSubmissionFilter
+    search_fields = ["project_code", "title", "student__username"]
+    ordering_fields = ["submitted_at", "status", "project_code"]
+
+    def get_permissions(self):
+        if self.action == "create":
+            return [IsStudent()]
+        if self.action in ("update", "partial_update", "destroy"):
+            return [IsMentorAuditor()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        return submissions_for(self.request.user).select_related("cohort", "student").order_by("-submitted_at")
+
+    def perform_create(self, serializer):
+        serializer.save(student=self.request.user)
 
 
-class IsRegionalAuditor(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(
-            request.user
-            and request.user.is_authenticated
-            and request.user.role in ("REGIONAL_AUDITOR", "NATIONAL_ADMIN", "AGENT_SERVICE")
-        )
+class AnalysisMetricViewSet(StudentScopedMixin, viewsets.ModelViewSet):
+    queryset = AnalysisMetric.objects.select_related("submission").order_by("-timestamp")
+    serializer_class = AnalysisMetricSerializer
+    filter_backends = FILTERS
+    filterset_class = AnalysisMetricFilter
+    ordering_fields = ["timestamp", "value"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated()]
+        return [IsStaffRole()]
 
 
-class IsNationalAdmin(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(
-            request.user
-            and request.user.is_authenticated
-            and request.user.role == "NATIONAL_ADMIN"
-        )
+class AuditFindingViewSet(StudentScopedMixin, viewsets.ModelViewSet):
+    queryset = AuditFinding.objects.select_related("submission").order_by("-detected_at")
+    serializer_class = AuditFindingSerializer
+    filter_backends = FILTERS
+    filterset_class = AuditFindingFilter
+    search_fields = ["description"]
+    ordering_fields = ["detected_at", "severity"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated()]
+        return [IsStaffRole()]
 
 
-# ============================================================================
-# 3. Model Serializers
-# ============================================================================
-class CooperativeUnitSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CooperativeUnit
-        fields = "__all__"
+class AgentLoopExecutionViewSet(StudentScopedMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = (
+        AgentLoopExecution.objects.select_related("submission", "vc_receipt").order_by("-created_at")
+    )
+    serializer_class = AgentLoopExecutionSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = FILTERS
+    filterset_fields = ["submission", "trigger_source", "thread_id"]
 
 
-class ResourceNodePlotSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ResourceNodePlot
-        fields = "__all__"
-
-
-class TelemetryReadingSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = TelemetryReading
-        fields = "__all__"
-
-
-class AnomalyAndForecastEventSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AnomalyAndForecastEvent
-        fields = "__all__"
-
-
-class OnChainZKReceiptSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = OnChainZKReceipt
-        fields = "__all__"
-
-
-class AgentLoopExecutionSerializer(serializers.ModelSerializer):
-    zk_receipt = OnChainZKReceiptSerializer(read_only=True)
-
-    class Meta:
-        model = AgentLoopExecution
-        fields = "__all__"
-
-
-# ============================================================================
-# 4. DRF ViewSets & Darja Intent Webhook
-# ============================================================================
-class CooperativeUnitViewSet(viewsets.ModelViewSet):
-    queryset = CooperativeUnit.objects.all().order_by("-created_at")
-    serializer_class = CooperativeUnitSerializer
-    permission_classes = [IsCoopMember]
-
-
-class TelemetryReadingViewSet(viewsets.ModelViewSet):
-    queryset = TelemetryReading.objects.select_related("node").order_by("-timestamp")
-    serializer_class = TelemetryReadingSerializer
-    permission_classes = [IsCoopMember]
-
-
-class AnomalyAndForecastEventViewSet(viewsets.ModelViewSet):
-    queryset = AnomalyAndForecastEvent.objects.select_related("node").order_by("-detected_at")
-    serializer_class = AnomalyAndForecastEventSerializer
-    permission_classes = [IsRegionalAuditor]
-
-
-class OnChainZKReceiptViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = OnChainZKReceipt.objects.select_related("agent_execution").order_by("-block_number")
-    serializer_class = OnChainZKReceiptSerializer
-    permission_classes = [IsCoopMember]
-
-
-@api_view(["POST"])
-@permission_classes([permissions.AllowAny])
-def darja_intent_webhook(request):
-    """
-    POST /api/v1/darja-intent/
-    Accepts a Tunisian Darja transcript and sensor telemetry snapshot,
-    executes the stateful LangGraph loop + FastMCP tool + ZK settlement skill,
-    and returns the structured execution trace and on-chain receipt.
-    """
-    payload = request.data
-    state_out = run_sovereign_agent_loop({
-        "thread_id": payload.get("thread_id", "drf-darja-webhook-001"),
-        "node_code": payload.get("node_code", "KAS-SBEITLA-PLOT-04"),
-        "darja_input": payload.get(
-            "darja_input",
-            "Ya khouya fi Kasserine el sonda habtet 28% wel skhana 37 darja, lazmenna maa urgent!",
-        ),
-        "moisture_pct": float(payload.get("moisture_pct", 28.4)),
-        "temp_c": float(payload.get("temp_c", 37.2)),
-        "flow_l_min": float(payload.get("flow_l_min", 182.0)),
-        "parsed_intent": {},
-        "anomaly_report": {},
-        "mcp_allocation": {},
-        "zk_receipt": {},
-        "skills_trace": [],
-        "final_explanation": "",
-    })
-    return Response(state_out, status=status.HTTP_200_OK)
+class VerifiableCredentialViewSet(StudentScopedMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = VerifiableCredentialReceipt.objects.select_related("agent_execution").order_by("-block_number")
+    serializer_class = VerifiableCredentialReceiptSerializer
+    permission_classes = [IsAuthenticated]
+    student_lookup = "agent_execution__submission__student"
+    filter_backends = FILTERS
+    filterset_fields = ["student_did", "network_name", "is_verified_on_chain"]

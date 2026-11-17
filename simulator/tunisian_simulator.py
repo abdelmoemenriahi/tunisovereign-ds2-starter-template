@@ -1,58 +1,161 @@
+"""Code-quality telemetry simulator + gRPC client - Track 6 TuniSkill-DID.
+
+Simulates the CI / analysis sandboxes of Tunisian university projects: every project gets
+a daily analysis run over N days with realistic drift (tests improving, complexity creeping
+up near deadlines) and REPRODUCIBLE injected anomalies (same --seed => same data).
+
+Profiles (one per project, assigned round-robin):
+    healthy      steady good metrics, no anomaly
+    weak_tests   test pass rate collapses below the 85 % cohort minimum
+    plagiarized  AST similarity jumps above the 85 % plagiarism threshold
+    insecure     Bandit/Semgrep high-severity findings appear
+
+Ground-truth labels (`anomaly_label`) are kept so Week 2 can compute Precision/Recall/F1.
+
+Usage (repo root, gRPC server running, DB seeded with `python manage.py seed_demo`):
+    python -m simulator.tunisian_simulator --seed 42 --days 14            # send via gRPC
+    python -m simulator.tunisian_simulator --seed 42 --dry-run            # just print
+    python -m simulator.tunisian_simulator --urgent TSK-2026-003 --reason "Suspicious commit"
 """
-Tunisian Governorate Telemetry & Anomaly Stream Simulator
-Generates diurnal/seasonal telemetry across Kasserine, Sidi Bouzid, Gafsa, Kairouan, and Tozeur,
-injects controlled stress anomalies, and triggers the TuniSovereign-AI pipeline.
-"""
-import hashlib
-import hmac
-import math
+import argparse
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterator, List
+
+from grpc_service import signing
+
+DEFAULT_PROJECTS = [f"TSK-2026-{i:03d}" for i in range(1, 7)]
+PROFILES = ["healthy", "weak_tests", "plagiarized", "insecure"]
+ANOMALY_START_FRACTION = 0.6  # anomalies start at ~60 % of the observation window
 
 
-GOVERNORATE_NODES = [
-    {"node_code": "KAS-SBEITLA-PLOT-04", "governorate": "Kasserine", "base_moisture": 54.0, "base_temp": 27.0},
-    {"node_code": "SBZ-REGUEB-PLOT-02", "governorate": "Sidi_Bouzid", "base_moisture": 52.0, "base_temp": 28.5},
-    {"node_code": "GAF-METLAOUI-NODE-01", "governorate": "Gafsa", "base_moisture": 49.0, "base_temp": 30.0},
-    {"node_code": "KAI-CHERARDA-PLOT-07", "governorate": "Kairouan", "base_moisture": 55.0, "base_temp": 27.5},
-    {"node_code": "TOZ-NEFTA-OASIS-03", "governorate": "Tozeur", "base_moisture": 48.0, "base_temp": 32.0},
-]
+def generate_metrics(
+    projects: List[str] = None,
+    days: int = 14,
+    seed: int = 42,
+    start: datetime = None,
+) -> List[Dict]:
+    """Return signed metric records. Deterministic for a given (projects, days, seed, start)."""
+    projects = projects or DEFAULT_PROJECTS
+    rng = random.Random(seed)
+    start = start or datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc)
+    anomaly_day = int(days * ANOMALY_START_FRACTION)
+    records = []
+
+    for idx, code in enumerate(projects):
+        profile = PROFILES[idx % len(PROFILES)]
+        base_tests = rng.uniform(88, 96)
+        base_cyclo = rng.uniform(5, 9)
+        for day in range(days):
+            ts = (start + timedelta(days=day, minutes=rng.randint(0, 59))).isoformat()
+            progress = day / max(1, days - 1)
+            anomalous = day >= anomaly_day and profile != "healthy"
+
+            tests = min(100.0, base_tests + 4 * progress + rng.gauss(0, 1.2))
+            cyclo = max(1.0, base_cyclo + 3 * progress + rng.gauss(0, 0.6))  # grows toward the deadline
+            security = 0.0
+            ast_sim = max(0.0, rng.gauss(22, 6))
+
+            if anomalous and profile == "weak_tests":
+                tests = rng.uniform(40, 70)
+            if anomalous and profile == "plagiarized":
+                ast_sim = rng.uniform(88, 99)
+            if anomalous and profile == "insecure":
+                security = float(rng.randint(1, 4))
+
+            for metric_type, value in (
+                ("TESTPASS", tests),
+                ("CYCLO", cyclo),
+                ("SECURITY", security),
+                ("ASTSIM", ast_sim),
+            ):
+                value = round(value, 2)
+                is_anom = anomalous and (
+                    (profile == "weak_tests" and metric_type == "TESTPASS")
+                    or (profile == "plagiarized" and metric_type == "ASTSIM")
+                    or (profile == "insecure" and metric_type == "SECURITY")
+                )
+                records.append(
+                    {
+                        "project_code": code,
+                        "profile": profile,
+                        "metric_type": metric_type,
+                        "value": value,
+                        "iso_timestamp": ts,
+                        "signature_hmac": signing.sign(code, metric_type, value, ts),
+                        "anomaly_label": int(is_anom),
+                    }
+                )
+    return records
 
 
-def generate_telemetry_batch(hours: int = 24, inject_anomaly_at_hour: int = 14, secret_key: str = "tunisovereign-hmac") -> list:
-    rng = random.Random(42)
-    packets = []
-    for h in range(hours):
-        for node in GOVERNORATE_NODES:
-            diurnal = math.sin(2 * math.pi * h / 24.0)
-            moisture = node["base_moisture"] + 5.0 * diurnal + rng.uniform(-1.5, 1.5)
-            temp_c = node["base_temp"] - 4.5 * math.cos(2 * math.pi * h / 24.0) + rng.uniform(-0.8, 0.8)
+def _packets(records: List[Dict]) -> Iterator:
+    from grpc_service import tunisovereign_pb2 as pb2
 
-            if h in (inject_anomaly_at_hour, inject_anomaly_at_hour + 1) and node["governorate"] == "Kasserine":
-                moisture -= 24.5
-                temp_c += 9.5
+    for r in records:
+        yield pb2.TelemetryPacket(
+            project_code=r["project_code"],
+            metric_type=r["metric_type"],
+            value=r["value"],
+            iso_timestamp=r["iso_timestamp"],
+            signature_hmac=r["signature_hmac"],
+        )
 
-            iso_ts = datetime.now(timezone.utc).isoformat()
-            payload_str = f"{node['node_code']}|{node['governorate']}|MOISTURE|{moisture:.2f}|{iso_ts}"
-            sig = hmac.new(secret_key.encode("utf-8"), payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
 
-            packets.append({
-                "hour": h,
-                "node_code": node["node_code"],
-                "governorate": node["governorate"],
-                "metric_type": "MOISTURE",
-                "moisture_pct": round(moisture, 2),
-                "temp_c": round(temp_c, 2),
-                "iso_timestamp": iso_ts,
-                "signature_hmac": sig,
-            })
-    return packets
+def send_stream(records: List[Dict], target: str = "localhost:50051"):
+    """Client-streaming RPC: push every record to the Django gRPC server."""
+    import grpc
+
+    from grpc_service import tunisovereign_pb2_grpc as pb2_grpc
+
+    with grpc.insecure_channel(target) as channel:
+        stub = pb2_grpc.TelemetryIngestServiceStub(channel)
+        return stub.StreamTelemetry(_packets(records))
+
+
+def send_urgent_audit(project_code: str, reason: str, target: str = "localhost:50051"):
+    import grpc
+
+    from grpc_service import tunisovereign_pb2 as pb2, tunisovereign_pb2_grpc as pb2_grpc
+
+    with grpc.insecure_channel(target) as channel:
+        stub = pb2_grpc.TelemetryIngestServiceStub(channel)
+        return stub.TriggerUrgentAudit(pb2.AuditRequest(project_code=project_code, reason=reason))
+
+
+def main():
+    try:  # pick up GRPC_HMAC_SECRET from .env when run standalone
+        from dotenv import load_dotenv
+        from pathlib import Path
+
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    except ImportError:
+        pass
+
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--target", default="localhost:50051")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--days", type=int, default=14)
+    ap.add_argument("--projects", default=",".join(DEFAULT_PROJECTS))
+    ap.add_argument("--dry-run", action="store_true", help="print a summary, do not send")
+    ap.add_argument("--urgent", metavar="PROJECT_CODE", help="send one TriggerUrgentAudit instead")
+    ap.add_argument("--reason", default="Manual urgent audit")
+    args = ap.parse_args()
+
+    if args.urgent:
+        print(send_urgent_audit(args.urgent, args.reason, args.target))
+        return
+
+    records = generate_metrics(args.projects.split(","), args.days, args.seed)
+    labelled = sum(r["anomaly_label"] for r in records)
+    print(f"Generated {len(records)} signed packets (seed={args.seed}); {labelled} labelled anomalies.")
+    if args.dry_run:
+        for r in records[:5]:
+            print(r)
+        return
+    ack = send_stream(records, args.target)
+    print("Server ack:", ack)
 
 
 if __name__ == "__main__":
-    batch = generate_telemetry_batch(hours=24, inject_anomaly_at_hour=14)
-    print(f"Generated {len(batch)} signed Tunisian telemetry packets across {len(GOVERNORATE_NODES)} governorates.")
-    anomalies = [p for p in batch if p["moisture_pct"] < 35.0]
-    print(f"Injected critical anomaly packets (<35% moisture): {len(anomalies)}")
-    if anomalies:
-        print("Sample critical packet:", anomalies[0])
+    main()

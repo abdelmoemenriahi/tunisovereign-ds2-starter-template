@@ -1,32 +1,40 @@
 syntax = "proto3";
+
 package tunisovereign;
 
+// Contract-first gRPC service (Track 6 - TuniSkill-DID).
+// The code-analysis sandboxes / CI simulator stream metrics about student projects
+// to the Django evaluation orchestrator over binary HTTP/2.
 service TelemetryIngestService {
+  // Client-streaming: the simulator sends many packets, the server answers once.
   rpc StreamTelemetry (stream TelemetryPacket) returns (IngestAck);
+  // Unary: a mentor / sandbox requests an urgent audit of one project.
   rpc TriggerUrgentAudit (AuditRequest) returns (AuditResponse);
 }
 
 message TelemetryPacket {
-  string node_code = 1;
-  string governorate = 2;
-  string metric_type = 3;
-  double value = 4;
-  string iso_timestamp = 5;
-  string signature_hmac = 6;
+  string project_code   = 1;  // ProjectSubmission.project_code, e.g. "TSK-2026-001"
+  string metric_type    = 2;  // CYCLO | TESTPASS | SECURITY | ASTSIM (AnalysisMetric.MetricType)
+  double value          = 3;
+  string iso_timestamp  = 4;  // ISO-8601, e.g. 2026-11-20T09:30:00+00:00
+  string signature_hmac = 5;  // HMAC-SHA256 hex of "project|metric|value|timestamp"
 }
 
 message IngestAck {
-  int32 accepted_count = 1;
-  bool anomaly_triggered = 2;
-  string agent_thread_id = 3;
+  int32  accepted_count   = 1;  // packets stored as AnalysisMetric rows
+  int32  rejected_count   = 2;  // bad signature / unknown project / invalid value
+  int32  findings_created = 3;  // AuditFinding rows opened by threshold rules
+  bool   anomaly_triggered = 4; // true if at least one CRITICAL finding was opened
+  string agent_thread_id  = 5;  // thread id of the pending agent run (wired in Week 3)
 }
 
 message AuditRequest {
-  string node_code = 1;
-  string reason = 2;
+  string project_code = 1;
+  string reason       = 2;
 }
 
 message AuditResponse {
-  string status = 1;
-  string tx_hash = 2;
+  string status          = 1;  // AUDIT_QUEUED | PROJECT_NOT_FOUND
+  string tx_hash         = 2;  // empty until the blockchain layer exists (Week 3)
+  string agent_thread_id = 3;
 }

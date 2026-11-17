@@ -8,6 +8,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent   # .../backend
 ROOT_DIR = BASE_DIR.parent                          # repo root (where .env is)
 load_dotenv(ROOT_DIR / ".env", override=True)
 
+# Lets Django import the top-level `grpc_service` package (it lives next to backend/).
+import sys  # noqa: E402
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 DEBUG = os.getenv("DEBUG", "False") == "True"
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
@@ -21,6 +27,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "rest_framework_simplejwt",
+    "django_filters",
     "tunisovereign_core",
 ]
 
@@ -77,10 +84,14 @@ AUTH_PASSWORD_VALIDATORS = [
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
+        # Session auth lets you test the browsable API after logging in at /admin/.
+        "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 25,
 }
 
 SIMPLE_JWT = {
